@@ -2,12 +2,12 @@ import os
 import re
 import logging
 import asyncio
+import requests
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from flask import Flask
-from binance.client import Client
 
-# -------- Logging --------
+# ---------- Logging ----------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL),
@@ -15,26 +15,24 @@ logging.basicConfig(
 )
 log = logging.getLogger("signal_copier")
 
-# -------- Env Vars --------
+# ---------- Telegram API ----------
 API_ID = os.getenv("TG_API_ID")
 API_HASH = os.getenv("TG_API_HASH")
 TG_SESSION_ENV = os.getenv("TG_SESSION", "").strip()
-SOURCE_CHAT = os.getenv("SOURCE_CHAT")
-TARGET_CHAT = os.getenv("TARGET_CHAT")
 
 if TG_SESSION_ENV and len(TG_SESSION_ENV) > 100:
     session_obj = StringSession(TG_SESSION_ENV)
 else:
     session_obj = TG_SESSION_ENV or "session"
 
+SOURCE_CHAT = os.getenv("SOURCE_CHAT")
+TARGET_CHAT = os.getenv("TARGET_CHAT")
+
 if not API_ID or not API_HASH:
     log.error("TG_API_ID and TG_API_HASH must be set.")
     raise SystemExit(1)
 
-# Binance client (no API key needed for public price data)
-binance = Client()
-
-# -------- Regex --------
+# ---------- Regex ----------
 DIRECTION_RE = re.compile(r"\b(LONG|SHORT)\b", flags=re.I)
 PAIR_RE = re.compile(r"([A-Z]{2,10}/USDT)", flags=re.I)
 ENTRY_RE = re.compile(r"ENTRY.*?(?:PRICE|NOW)?[: ]*([0-9]*\.?[0-9]+)", flags=re.I)
@@ -42,7 +40,7 @@ LEVERAGE_RE = re.compile(r"(LEVERAGE|CROSS).*?(\d{1,3})\s*x?", flags=re.I)
 TP_RE = re.compile(r"(TP\d*|TAKE PROFIT)\s*[:=]?\s*([0-9]+%|[0-9]*\.?[0-9]+)", flags=re.I)
 SL_RE = re.compile(r"SL\s*[:=]?\s*([0-9]*\.?[0-9]+)", flags=re.I)
 
-# -------- Template --------
+# ---------- Template ----------
 CORNIX_TEMPLATE = (
     "{direction_upper} {pair}\n"
     "Leverage: {leverage}x\n"
@@ -52,14 +50,28 @@ CORNIX_TEMPLATE = (
     "Forwarded by signal-copier"
 )
 
-# -------- Flask Keepalive --------
+# ---------- Flask keep-alive ----------
 app = Flask("keepalive")
 
 @app.route("/")
 def home():
     return "OK - signal copier is running"
 
-# -------- Telegram Client --------
+# ---------- Helper: Get live price ----------
+def get_market_price(symbol: str) -> float:
+    """
+    Fetch current market price from Binance public API.
+    """
+    try:
+        url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol.upper().replace('/', '')}"
+        response = requests.get(url, timeout=5)
+        data = response.json()
+        return float(data["price"])
+    except Exception as e:
+        log.error(f"Error fetching market price for {symbol}: {e}")
+        return None
+
+# ---------- Bot logic ----------
 async def create_client_and_run():
     client = TelegramClient(session_obj, int(API_ID), API_HASH)
     await client.start()
@@ -99,44 +111,29 @@ async def create_client_and_run():
 
             # Entry
             entry_m = ENTRY_RE.search(text)
-            entry = float(entry_m.group(1)) if entry_m else None
-            entry_str = f"{entry:.5f}" if entry else "Market Price"
+            if entry_m:
+                entry_price = float(entry_m.group(1))
+            else:
+                entry_price = get_market_price(pair.replace("#", "").replace("/", ""))
+            entry_str = f"{entry_price:.5f}" if entry_price else "Market Price"
 
-            # If entry missing -> fetch market price from Binance
-            if not entry:
-                try:
-                    symbol = pair.replace("#", "").replace("/", "")
-                    ticker = binance.get_symbol_ticker(symbol=symbol.upper())
-                    entry = float(ticker["price"])
-                    entry_str = f"{entry:.5f}"
-                except Exception as e:
-                    log.warning("Could not fetch market price: %s", e)
-
-            # TP
-            raw_tps = []
-            for m in TP_RE.findall(text):
-                val = m[1].strip()
-                if val not in raw_tps:  # avoid duplicates
-                    raw_tps.append(val)
-
+            # Take Profits
+            tp_matches = [m[1] for m in TP_RE.findall(text)]
             tps_block = ""
-            for i, tp in enumerate(raw_tps, start=1):
-                if entry:
-                    if tp.endswith("%"):
-                        if tp == "500%":
-                            price = entry * 1.1
-                            tps_block += f"TP{i}: {price:.5f}\n"
-                        elif tp == "1000%":
-                            price = entry * 2.2
-                            tps_block += f"TP{i}: {price:.5f}\n"
-                        else:
-                            tps_block += f"TP{i}: {tp}\n"
+            for i, tp in enumerate(tp_matches[:5], start=1):
+                if entry_price:
+                    if tp.strip() == "500%":
+                        price = entry_price * 1.1
+                        tps_block += f"TP{i}: {price:.5f}\n"
+                    elif tp.strip() == "1000%":
+                        price = entry_price * 2.2
+                        tps_block += f"TP{i}: {price:.5f}\n"
                     else:
                         tps_block += f"TP{i}: {tp}\n"
                 else:
                     tps_block += f"TP{i}: {tp}\n"
 
-            # SL
+            # Stop loss
             sl_m = SL_RE.search(text)
             sl = sl_m.group(1) if sl_m else "N/A"
 
@@ -162,6 +159,7 @@ async def create_client_and_run():
     log.info("Listening... (source=%s -> target=%s)", resolved_source, resolved_target)
     await client.run_until_disconnected()
 
+# ---------- Run ----------
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     from threading import Thread

@@ -110,11 +110,19 @@ async def create_client_and_run():
             leverage = leverage_m.group(2) if leverage_m else "0"
 
             # Entry
+            entry_price = None
             entry_m = ENTRY_RE.search(text)
             if entry_m:
-                entry_price = float(entry_m.group(1))
-            else:
-                entry_price = get_market_price(pair.replace("#", "").replace("/", ""))
+                try:
+                    entry_price = float(entry_m.group(1))
+                except:
+                    entry_price = None
+
+            # If no entry → fetch live market price
+            if not entry_price:
+                symbol = pair.replace("#", "").replace("/", "")
+                entry_price = get_market_price(symbol)
+
             entry_str = f"{entry_price:.5f}" if entry_price else "Market Price"
 
             # Take Profits
